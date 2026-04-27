@@ -133,6 +133,120 @@
   const SHAKE_AMPLITUDE = 8;
   let muzzleFlash = 0;       // frames remaining (1-frame flash on fire)
 
+  // ---------- Audio (Web Audio, all procedural — zero asset files) ----------
+  // Lazily initialized on first user gesture (browsers block autoplay).
+  // Single AudioContext + master gain for mute control.
+  const Audio = (() => {
+    let ctx = null, master = null, muted = false;
+    let lastWhoosh = 0, lastHeartbeat = 0, fastInputSince = 0;
+    let noiseBuf = null;
+
+    function ensure() {
+      if (ctx) return ctx;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = 0.5;
+      master.connect(ctx.destination);
+      // Pre-build 1s of white noise — reused for all noise-based sounds.
+      const n = ctx.sampleRate;
+      noiseBuf = ctx.createBuffer(1, n, n);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+      return ctx;
+    }
+
+    function tone(freq, dur, type='sine', gain=0.3, slideTo=null) {
+      if (!ensure() || muted) return;
+      const t0 = ctx.currentTime;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t0);
+      if (slideTo != null) o.frequency.linearRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(master);
+      o.start(t0);
+      o.stop(t0 + dur);
+    }
+
+    function noise(dur, filterFreq, gain=0.3) {
+      if (!ensure() || muted) return;
+      const t0 = ctx.currentTime;
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.value = filterFreq;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(filt).connect(g).connect(master);
+      src.start(t0);
+      src.stop(t0 + dur);
+    }
+
+    function noiseSweep(dur, fStart, fEnd, gain=0.25) {
+      if (!ensure() || muted) return;
+      const t0 = ctx.currentTime;
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'bandpass';
+      filt.Q.value = 4;
+      filt.frequency.setValueAtTime(fStart, t0);
+      filt.frequency.linearRampToValueAtTime(fEnd, t0 + dur);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(filt).connect(g).connect(master);
+      src.start(t0);
+      src.stop(t0 + dur);
+    }
+
+    return {
+      get muted() { return muted; },
+      toggleMute() {
+        muted = !muted;
+        if (master) master.gain.value = muted ? 0 : 0.5;
+      },
+      // Heartbeat: BPM scales with (1 - timeScale). Frozen → slow steady pulse.
+      // Beats above ~0.95 timeScale are suppressed (drowned by chaos).
+      heartbeat(now, timeScale) {
+        if (!ensure() || muted || timeScale > 0.95) return;
+        const interval = 0.5 + timeScale * 0.5; // 0.5s frozen → 1.0s busy
+        if (now - lastHeartbeat < interval * 1000) return;
+        lastHeartbeat = now;
+        tone(60, 0.12, 'sine', 0.4 * (1 - timeScale));
+      },
+      fire()       { noise(0.08, 1500, 0.25); },
+      enemyFire()  { noise(0.06, 2800, 0.12); },
+      hit()        { tone(120, 0.18, 'sine', 0.4, 60); noise(0.05, 4000, 0.2); },
+      death()      { tone(220, 1.0, 'sawtooth', 0.4, 50); },
+      whoosh(now, mouseVel) {
+        if (mouseVel > 800) {
+          if (!fastInputSince) fastInputSince = now;
+          if (now - fastInputSince > 100 && now - lastWhoosh > 600) {
+            lastWhoosh = now;
+            noiseSweep(0.25, 400, 1800, 0.2);
+          }
+        } else {
+          fastInputSince = 0;
+        }
+      },
+      // Force-resume on user gesture
+      kick() { ensure(); if (ctx && ctx.state === 'suspended') ctx.resume(); },
+    };
+  })();
+  // Wire mute toggle + first-gesture audio kick
+  addEventListener('keydown', e => {
+    Audio.kick();
+    if (e.key.toLowerCase() === 'm') Audio.toggleMute();
+  });
+  addEventListener('mousedown', () => Audio.kick());
+
   function resetGame() {
     bullets.length = 0;
     playerBullets.length = 0;
@@ -168,6 +282,8 @@
     const dtSim   = gameState === 'playing' ? dtReal : 0;
 
     if (gameState === 'playing') elapsed += dtReal;
+    Audio.heartbeat(now, timeScale);
+    Audio.whoosh(now, mouseVel);
 
     // --- Player: REAL time, independent of mouse ---
     let dx = 0, dy = 0;
@@ -196,6 +312,7 @@
       });
       fireTimer = FIRE_COOLDOWN;
       muzzleFlash = 1;
+      Audio.fire();
     }
 
     // --- Shooters: WORLD time ---
@@ -212,6 +329,7 @@
           vy: (ay / m) * BULLET_SPEED,
           trail: [],
         });
+        Audio.enemyFire();
       }
     }
 
@@ -249,6 +367,7 @@
           playerBullets.splice(i, 1);
           kills++;
           shakeTime = SHAKE_DURATION;
+          Audio.hit();
           break;
         }
       }
@@ -271,6 +390,7 @@
         gameState = 'dead';
         finalScore = Math.floor(kills * 100 + elapsed * 5 + nearMisses * 10);
         bullets.splice(i, 1);
+        Audio.death();
         continue;
       }
       // near-miss: count once per bullet when it passes within 30px without hitting
@@ -410,7 +530,8 @@
       `mouse vel:   ${mouseVel.toFixed(0).padStart(4)} px/s\n` +
       `bullets:     ${bullets.length}\n` +
       `kills:       ${kills}\n` +
-      `time:        ${mins}:${secs}`;
+      `time:        ${mins}:${secs}\n` +
+      `audio:       ${Audio.muted ? '🔇' : '🔊'}`;
 
     // Death overlay
     if (gameState === 'dead') {
