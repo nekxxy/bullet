@@ -120,6 +120,32 @@
   const playerBullets = [];  // player bullets (blue)
   let kills = 0;
   let fireTimer = 0;         // REAL-time cooldown
+  let elapsed = 0;           // seconds survived (REAL time)
+  let nearMisses = 0;
+  // 'playing' | 'dead'. Death freezes everything until restart.
+  let gameState = 'playing';
+  let finalScore = 0;
+
+  function resetGame() {
+    bullets.length = 0;
+    playerBullets.length = 0;
+    shooters.length = 0;
+    shooters.push(
+      { x: W / 2,  y: 60,     cooldown: 1.5 },
+      { x: 60,     y: H - 60, cooldown: 1.0 },
+      { x: W - 60, y: H - 60, cooldown: 0.5 },
+    );
+    player.x = W / 2; player.y = H / 2;
+    kills = 0; fireTimer = 0; elapsed = 0; nearMisses = 0; finalScore = 0;
+    gameState = 'playing';
+  }
+  // Restart bindings
+  addEventListener('keydown', e => {
+    if (gameState === 'dead' && e.key.toLowerCase() === 'r') resetGame();
+  });
+  addEventListener('mousedown', e => {
+    if (gameState === 'dead' && e.button === 0) resetGame();
+  });
 
   // ---------- Loop ----------
   let lastT = performance.now();
@@ -129,7 +155,12 @@
     lastT = now;
 
     const { scale: timeScale, velocity: mouseVel } = computeTimeScale(now);
-    const dtWorld = dtReal * timeScale;
+    // Death freezes everything (world AND player). Mouse-time scale still
+    // displayed in HUD so the player can verify input is registered.
+    const dtWorld = gameState === 'playing' ? dtReal * timeScale : 0;
+    const dtSim   = gameState === 'playing' ? dtReal : 0;
+
+    if (gameState === 'playing') elapsed += dtReal;
 
     // --- Player: REAL time, independent of mouse ---
     let dx = 0, dy = 0;
@@ -137,19 +168,17 @@
     if (keys.has('s') || keys.has('arrowdown'))  dy += 1;
     if (keys.has('a') || keys.has('arrowleft'))  dx -= 1;
     if (keys.has('d') || keys.has('arrowright')) dx += 1;
-    if (dx || dy) {
+    if ((dx || dy) && gameState === 'playing') {
       const m = Math.hypot(dx, dy);
-      player.x += (dx / m) * PLAYER_SPEED * dtReal;
-      player.y += (dy / m) * PLAYER_SPEED * dtReal;
+      player.x += (dx / m) * PLAYER_SPEED * dtSim;
+      player.y += (dy / m) * PLAYER_SPEED * dtSim;
     }
     player.x = Math.max(PLAYER_RADIUS, Math.min(W - PLAYER_RADIUS, player.x));
     player.y = Math.max(PLAYER_RADIUS, Math.min(H - PLAYER_RADIUS, player.y));
 
     // --- Player firing: REAL-time cooldown ---
-    // Cooldown is real-time on purpose. Otherwise a frozen player could
-    // queue up infinite bullets and unleash everything in one flick.
-    fireTimer = Math.max(0, fireTimer - dtReal);
-    if (mouseDown && fireTimer <= 0) {
+    fireTimer = Math.max(0, fireTimer - dtSim);
+    if (mouseDown && fireTimer <= 0 && gameState === 'playing') {
       const ax = mouseX - player.x, ay = mouseY - player.y;
       const m = Math.hypot(ax, ay) || 1;
       playerBullets.push({
@@ -215,10 +244,18 @@
       const b = bullets[i];
       b.x += b.vx * dtWorld;
       b.y += b.vy * dtWorld;
-      if (Math.hypot(b.x - player.x, b.y - player.y) < BULLET_RADIUS + PLAYER_RADIUS) {
-        console.log('HIT');
+      const d = Math.hypot(b.x - player.x, b.y - player.y);
+      // hit
+      if (d < BULLET_RADIUS + PLAYER_RADIUS && gameState === 'playing') {
+        gameState = 'dead';
+        finalScore = Math.floor(kills * 100 + elapsed * 5 + nearMisses * 10);
         bullets.splice(i, 1);
         continue;
+      }
+      // near-miss: count once per bullet when it passes within 30px without hitting
+      if (!b.nearMissed && d < 30 + PLAYER_RADIUS && gameState === 'playing') {
+        b.nearMissed = true;
+        nearMisses++;
       }
       if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) {
         bullets.splice(i, 1);
@@ -281,11 +318,33 @@
     ctx.stroke();
 
     // HUD
+    const mins = Math.floor(elapsed / 60);
+    const secs = Math.floor(elapsed % 60).toString().padStart(2, '0');
     hud.textContent =
       `time scale:  ${timeScale.toFixed(2)}\n` +
       `mouse vel:   ${mouseVel.toFixed(0).padStart(4)} px/s\n` +
       `bullets:     ${bullets.length}\n` +
-      `kills:       ${kills}`;
+      `kills:       ${kills}\n` +
+      `time:        ${mins}:${secs}`;
+
+    // Death overlay
+    if (gameState === 'dead') {
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#000';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 64px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillText('BULLET TIME', W / 2, H / 2 - 80);
+      ctx.font = '20px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillText(
+        `TIME: ${elapsed.toFixed(1)}s   KILLS: ${kills}   SCORE: ${finalScore}`,
+        W / 2, H / 2,
+      );
+      ctx.font = '16px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillStyle = '#666';
+      ctx.fillText('PRESS R OR CLICK TO RESTART', W / 2, H / 2 + 60);
+      ctx.textAlign = 'start';
+    }
 
     requestAnimationFrame(frame);
   }
