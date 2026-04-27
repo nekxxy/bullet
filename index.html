@@ -49,6 +49,10 @@
   const SMOOTH_WINDOW_MS  = 150;   // mouse-velocity smoothing window
   const MAX_MOUSE_VEL     = 1000;  // px/sec → time scale clamps to 1.0
   const TIME_CURVE        = 1.5;   // exponent: >1 = slow movement feels more cinematic
+  const PLAYER_BULLET_SPEED = 600; // px/sec, WORLD time — fast enough to feel responsive
+  const PLAYER_BULLET_RADIUS = 3;
+  const FIRE_COOLDOWN     = 0.15;  // sec, REAL time — prevents pre-frozen spam
+  const SHOOTER_RADIUS    = 14;
 
   // ---------- Input ----------
   const keys = new Set();
@@ -57,11 +61,16 @@
 
   // Listen on window so we still track the mouse if it leaves the canvas.
   let mouseX = W / 2, mouseY = H / 2;
+  let mouseDown = false;
   addEventListener('mousemove', e => {
     const r = canvas.getBoundingClientRect();
     mouseX = e.clientX - r.left;
     mouseY = e.clientY - r.top;
   });
+  addEventListener('mousedown', e => { if (e.button === 0) mouseDown = true; });
+  addEventListener('mouseup',   e => { if (e.button === 0) mouseDown = false; });
+  // Suppress context menu so right-click reserves cleanly later.
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
 
   // ---------- THE function to tune ----------
   // Returns { scale, velocity } where scale ∈ [0, 1].
@@ -107,7 +116,10 @@
     { x: W - 60,   y: H - 60, cooldown: 0.5 },
   ];
 
-  const bullets = [];
+  const bullets = [];        // enemy bullets (red)
+  const playerBullets = [];  // player bullets (blue)
+  let kills = 0;
+  let fireTimer = 0;         // REAL-time cooldown
 
   // ---------- Loop ----------
   let lastT = performance.now();
@@ -133,8 +145,24 @@
     player.x = Math.max(PLAYER_RADIUS, Math.min(W - PLAYER_RADIUS, player.x));
     player.y = Math.max(PLAYER_RADIUS, Math.min(H - PLAYER_RADIUS, player.y));
 
+    // --- Player firing: REAL-time cooldown ---
+    // Cooldown is real-time on purpose. Otherwise a frozen player could
+    // queue up infinite bullets and unleash everything in one flick.
+    fireTimer = Math.max(0, fireTimer - dtReal);
+    if (mouseDown && fireTimer <= 0) {
+      const ax = mouseX - player.x, ay = mouseY - player.y;
+      const m = Math.hypot(ax, ay) || 1;
+      playerBullets.push({
+        x: player.x, y: player.y,
+        vx: (ax / m) * PLAYER_BULLET_SPEED,
+        vy: (ay / m) * PLAYER_BULLET_SPEED,
+      });
+      fireTimer = FIRE_COOLDOWN;
+    }
+
     // --- Shooters: WORLD time ---
-    for (const s of shooters) {
+    for (let si = shooters.length - 1; si >= 0; si--) {
+      const s = shooters[si];
       s.cooldown -= dtWorld;
       if (s.cooldown <= 0) {
         s.cooldown += SHOOT_INTERVAL;
@@ -145,6 +173,40 @@
           vx: (ax / m) * BULLET_SPEED,
           vy: (ay / m) * BULLET_SPEED,
         });
+      }
+    }
+
+    // --- Player bullets: WORLD time. Pre-aim while frozen, release on flick. ---
+    for (let i = playerBullets.length - 1; i >= 0; i--) {
+      const b = playerBullets[i];
+      b.x += b.vx * dtWorld;
+      b.y += b.vy * dtWorld;
+      // off-screen
+      if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) {
+        playerBullets.splice(i, 1);
+        continue;
+      }
+      // vs enemy bullets — both removed
+      let consumed = false;
+      for (let j = bullets.length - 1; j >= 0; j--) {
+        const eb = bullets[j];
+        if (Math.hypot(b.x - eb.x, b.y - eb.y) < PLAYER_BULLET_RADIUS + BULLET_RADIUS) {
+          bullets.splice(j, 1);
+          playerBullets.splice(i, 1);
+          consumed = true;
+          break;
+        }
+      }
+      if (consumed) continue;
+      // vs shooters — kill and remove
+      for (let j = shooters.length - 1; j >= 0; j--) {
+        const s = shooters[j];
+        if (Math.hypot(b.x - s.x, b.y - s.y) < PLAYER_BULLET_RADIUS + SHOOTER_RADIUS) {
+          shooters.splice(j, 1);
+          playerBullets.splice(i, 1);
+          kills++;
+          break;
+        }
       }
     }
 
@@ -182,11 +244,19 @@
       ctx.restore();
     }
 
-    // bullets
+    // bullets (enemy, red)
     ctx.fillStyle = '#d00';
     for (const b of bullets) {
       ctx.beginPath();
       ctx.arc(b.x, b.y, BULLET_RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // player bullets (blue)
+    ctx.fillStyle = '#0080ff';
+    for (const b of playerBullets) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, PLAYER_BULLET_RADIUS, 0, Math.PI * 2);
       ctx.fill();
     }
 
@@ -214,7 +284,8 @@
     hud.textContent =
       `time scale:  ${timeScale.toFixed(2)}\n` +
       `mouse vel:   ${mouseVel.toFixed(0).padStart(4)} px/s\n` +
-      `bullets:     ${bullets.length}`;
+      `bullets:     ${bullets.length}\n` +
+      `kills:       ${kills}`;
 
     requestAnimationFrame(frame);
   }
