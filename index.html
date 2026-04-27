@@ -47,7 +47,8 @@
   const BULLET_RADIUS     = 4;
   const SHOOT_INTERVAL    = 1.5;   // sec, WORLD time
   const SMOOTH_WINDOW_MS  = 150;   // mouse-velocity smoothing window
-  const MAX_MOUSE_VEL     = 1500;  // px/sec → time scale clamps to 1.0
+  const MAX_MOUSE_VEL     = 1000;  // px/sec → time scale clamps to 1.0
+  const TIME_CURVE        = 1.5;   // exponent: >1 = slow movement feels more cinematic
 
   // ---------- Input ----------
   const keys = new Set();
@@ -88,7 +89,10 @@
     const span = (mouseSamples[mouseSamples.length - 1].t - mouseSamples[0].t) / 1000;
     if (span <= 0) return { scale: 0, velocity: 0 };
     const velocity = dist / span;
-    const scale = Math.min(1, velocity / MAX_MOUSE_VEL);
+    // Exponential mapping: pow(vel/MAX, 1.5). Makes slow drags feel cinematic
+    // — the world barely creeps until you commit to a real flick.
+    const norm = Math.min(1, velocity / MAX_MOUSE_VEL);
+    const scale = Math.pow(norm, TIME_CURVE);
     return { scale, velocity };
   }
 
@@ -185,6 +189,17 @@
       ctx.arc(b.x, b.y, BULLET_RADIUS, 0, Math.PI * 2);
       ctx.fill();
     }
+
+    // aim line (dashed grey, faint) — player → mouse. Sets up cycle-2 gun.
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(player.x, player.y);
+    ctx.lineTo(mouseX, mouseY);
+    ctx.stroke();
+    ctx.restore();
 
     // player (white fill, black outline — outline is critical on white bg)
     ctx.fillStyle = '#fff';
