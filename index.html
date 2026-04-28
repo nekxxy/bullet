@@ -177,9 +177,56 @@
     return [];
   }
 
+  // Boss AI: 4 phases gated by HP. Mutates s; spawns bullets via shooterFire.
+  function bossTick(s, dtWorld) {
+    if (s.hp > 75)      s.phase = 1;
+    else if (s.hp > 50) s.phase = 2;
+    else if (s.hp > 25) s.phase = 3;
+    else                s.phase = 4;
+    s.cooldown -= dtWorld;
+    if (s.phase === 1) {
+      // Slow radial rings every 2s
+      if (s.cooldown <= 0) { s.cooldown = 2.0; shooterFire({ ...s, pattern: 'radial' }); }
+    } else if (s.phase === 2) {
+      // Two rotating spiral arms with brief pauses
+      if (s.cooldown <= 0) {
+        s.cooldown = 0.10;
+        for (let arm = 0; arm < 2; arm++) {
+          const a = s.spiralAngle + arm * Math.PI;
+          spawnEnemyBullet(s, Math.cos(a) * BULLET_SPEED, Math.sin(a) * BULLET_SPEED);
+        }
+        s.spiralAngle += 0.4;
+        s._burst = (s._burst || 0) + 1;
+        if (s._burst > 16) { s.cooldown = 1.2; s._burst = 0; }
+      }
+    } else if (s.phase === 3) {
+      // Teleport every 3s, fire triple on arrival
+      s.teleportIn -= dtWorld;
+      if (s.teleportIn <= 0) {
+        s.teleportIn = 3;
+        s.x = 120 + Math.random() * (W - 240);
+        s.y = 120 + Math.random() * (H - 240);
+        shooterFire({ ...s, pattern: 'triple' });
+      }
+    } else { // phase 4 — everything, fast
+      if (s.cooldown <= 0) {
+        s.cooldown = 0.5;
+        shooterFire({ ...s, pattern: 'radial' });
+        shooterFire({ ...s, pattern: 'triple' });
+        s.spiralAngle += 0.6;
+        spawnEnemyBullet(s,
+          Math.cos(s.spiralAngle) * BULLET_SPEED,
+          Math.sin(s.spiralAngle) * BULLET_SPEED);
+      }
+    }
+  }
+
   let currentWave = 1;
   let waveClearTimer = 0; // seconds — non-zero during wave-clear flash
   let shooters = makeWave(currentWave);
+  // Win state — boss defeated. Flash overlay then "YOU WIN".
+  let winFlash = 0;       // seconds (slow-mo + white flash window)
+  const WIN_FLASH_DURATION = 2;
 
   function spawnEnemyBullet(s, vx, vy) {
     bullets.push({ x: s.x, y: s.y, vx, vy, trail: [] });
@@ -343,6 +390,7 @@
     playerBullets.length = 0;
     currentWave = 1;
     waveClearTimer = 0;
+    winFlash = 0;
     shooters = makeWave(currentWave);
     player.x = W / 2; player.y = H / 2;
     kills = 0; fireTimer = 0; elapsed = 0; nearMisses = 0; finalScore = 0;
@@ -350,10 +398,10 @@
   }
   // Restart bindings
   addEventListener('keydown', e => {
-    if (gameState === 'dead' && e.key.toLowerCase() === 'r') resetGame();
+    if ((gameState === 'dead' || gameState === 'won') && e.key.toLowerCase() === 'r') resetGame();
   });
   addEventListener('mousedown', e => {
-    if (gameState === 'dead' && e.button === 0) resetGame();
+    if ((gameState === 'dead' || gameState === 'won') && e.button === 0) resetGame();
   });
 
   // ---------- Loop ----------
@@ -364,10 +412,18 @@
     lastT = now;
 
     const { scale: timeScale, velocity: mouseVel } = computeTimeScale(now);
-    // Death freezes everything (world AND player). Mouse-time scale still
-    // displayed in HUD so the player can verify input is registered.
-    const dtWorld = gameState === 'playing' ? dtReal * timeScale : 0;
-    const dtSim   = gameState === 'playing' ? dtReal : 0;
+    // During win flash: 2s slow-mo (world at 0.2x regardless of mouse).
+    let effectiveScale = timeScale;
+    if (winFlash > 0) {
+      winFlash -= dtReal;
+      effectiveScale = 0.2;
+      if (winFlash <= 0 && gameState === 'playing') {
+        gameState = 'won';
+        finalScore = Math.floor(kills * 100 + elapsed * 5 + nearMisses * 10);
+      }
+    }
+    const dtWorld = (gameState === 'playing') ? dtReal * effectiveScale : 0;
+    const dtSim   = (gameState === 'playing') ? dtReal : 0;
 
     if (gameState === 'playing') elapsed += dtReal;
     Audio.heartbeat(now, timeScale);
@@ -423,10 +479,11 @@
         }
       }
       s.cooldown -= dtWorld;
-      if (s.cooldown <= 0) {
+      if (s.type === 'boss') {
+        bossTick(s, dtWorld);
+      } else if (s.cooldown <= 0) {
         s.cooldown += s.fireInterval;
-        if (s.type !== 'boss') shooterFire(s);
-        // boss firing handled separately in cycle 7
+        shooterFire(s);
       }
     }
 
@@ -473,15 +530,28 @@
         }
       }
       if (consumed) continue;
-      // vs shooters — kill and remove
+      // vs shooters — kill (1-shot for normal, HP for boss)
       for (let j = shooters.length - 1; j >= 0; j--) {
         const s = shooters[j];
-        if (Math.hypot(b.x - s.x, b.y - s.y) < PLAYER_BULLET_RADIUS + SHOOTER_RADIUS) {
-          shooters.splice(j, 1);
-          playerBullets.splice(i, 1);
-          kills++;
-          shakeTime = SHAKE_DURATION;
-          Audio.hit();
+        const r = s.type === 'boss' ? 50 : SHOOTER_RADIUS;
+        if (Math.hypot(b.x - s.x, b.y - s.y) < PLAYER_BULLET_RADIUS + r) {
+          if (s.type === 'boss') {
+            s.hp = (s.hp ?? 100) - 1;
+            playerBullets.splice(i, 1);
+            if (s.hp <= 0) {
+              shooters.splice(j, 1);
+              kills++;
+              winFlash = WIN_FLASH_DURATION;
+              shakeTime = SHAKE_DURATION;
+              Audio.hit();
+            }
+          } else {
+            shooters.splice(j, 1);
+            playerBullets.splice(i, 1);
+            kills++;
+            shakeTime = SHAKE_DURATION;
+            Audio.hit();
+          }
           break;
         }
       }
@@ -677,6 +747,48 @@
       ctx.textAlign = 'center';
       ctx.font = 'bold 48px ui-monospace, Menlo, Consolas, monospace';
       ctx.fillText(`WAVE ${currentWave} CLEARED`, W / 2, H / 2);
+      ctx.textAlign = 'start';
+    }
+
+    // Boss HP bar — visible whenever a boss is alive.
+    const boss = shooters.find(s => s.type === 'boss');
+    if (boss) {
+      const w = W - 80, h = 14, x = 40, y = 18;
+      ctx.fillStyle = '#fff';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(x, y, w * Math.max(0, boss.hp / 100), h);
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = '#000';
+      ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`BOSS  HP ${Math.max(0, boss.hp)}/100  PHASE ${boss.phase}`, W/2, y + 11);
+      ctx.textAlign = 'start';
+    }
+
+    // Win flash (white wash) during slow-mo window
+    if (winFlash > 0) {
+      const a = winFlash / WIN_FLASH_DURATION;
+      ctx.fillStyle = `rgba(255,255,255,${(a * 0.8).toFixed(3)})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // Win overlay
+    if (gameState === 'won') {
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#000';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 80px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillText('YOU WIN', W / 2, H / 2 - 40);
+      ctx.font = '20px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillText(`SCORE: ${finalScore}   KILLS: ${kills}   TIME: ${elapsed.toFixed(1)}s`,
+        W / 2, H / 2 + 20);
+      ctx.font = '16px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillStyle = '#666';
+      ctx.fillText('PRESS R OR CLICK TO RESTART', W / 2, H / 2 + 80);
       ctx.textAlign = 'start';
     }
 
