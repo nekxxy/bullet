@@ -109,13 +109,104 @@
   // ---------- World ----------
   const player = { x: W / 2, y: H / 2 };
 
-  // Three shooters in a triangle around the arena edge.
-  // Stagger initial cooldowns so they don't all fire in lockstep.
-  const shooters = [
-    { x: W / 2,    y: 60,     cooldown: 1.5 },
-    { x: 60,       y: H - 60, cooldown: 1.0 },
-    { x: W - 60,   y: H - 60, cooldown: 0.5 },
-  ];
+  // ---------- Wave system ----------
+  // Each wave defines a list of shooters by archetype. Wave clears when all
+  // are dead. Walker shooters drift toward a random nearby target every ~2s.
+  // Patterns: single, triple, radial, spiral. Spirals carry a rotating angle.
+  const PATTERNS = ['single', 'triple', 'radial', 'spiral'];
+
+  // Helper: place N shooters evenly around the arena perimeter
+  function ringPositions(n, inset = 70) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+      out.push({
+        x: W / 2 + Math.cos(a) * (W / 2 - inset),
+        y: H / 2 + Math.sin(a) * (H / 2 - inset),
+      });
+    }
+    return out;
+  }
+  function buildShooter(pos, type, pattern, fireInterval) {
+    return {
+      x: pos.x, y: pos.y,
+      type,                 // 'static' | 'walker' | 'boss' (boss in cycle 7)
+      pattern,              // see PATTERNS
+      cooldown: fireInterval * Math.random(), // stagger
+      fireInterval,
+      // walker state
+      tx: pos.x, ty: pos.y, retargetIn: 2,
+      // spiral state
+      spiralAngle: 0,
+    };
+  }
+  function makeWave(num) {
+    // Rule-based generation per the design doc.
+    if (num <= 3) {
+      return ringPositions(num).map(p => buildShooter(p, 'static', 'single', 1.5));
+    }
+    if (num <= 6) {
+      const n = Math.min(3, num - 1);
+      return ringPositions(n).map(p => buildShooter(p, 'walker', 'single', 1.4));
+    }
+    if (num <= 9) {
+      return ringPositions(3).map(p => buildShooter(p, 'walker', 'triple', 2.2));
+    }
+    if (num <= 12) {
+      return ringPositions(3).map(p => buildShooter(p, 'walker', 'radial', 2.8));
+    }
+    if (num <= 15) {
+      return ringPositions(5).map((p, i) =>
+        buildShooter(p, 'walker', i % 2 ? 'triple' : 'radial', 2.4));
+    }
+    if (num <= 18) {
+      return ringPositions(4).map(p => buildShooter(p, 'walker', 'spiral', 0.12));
+    }
+    if (num === 19) {
+      return ringPositions(6).map((p, i) =>
+        buildShooter(p, 'walker', PATTERNS[i % 4], i % 4 === 3 ? 0.12 : 1.8));
+    }
+    if (num === 20) {
+      // Boss placeholder — replaced in cycle 7
+      return [{
+        x: W / 2, y: H / 2, type: 'boss', pattern: 'radial',
+        cooldown: 1, fireInterval: 2, tx: W/2, ty: H/2, retargetIn: 2,
+        spiralAngle: 0, hp: 100, phase: 1, rot: 0, teleportIn: 3,
+      }];
+    }
+    return [];
+  }
+
+  let currentWave = 1;
+  let waveClearTimer = 0; // seconds — non-zero during wave-clear flash
+  let shooters = makeWave(currentWave);
+
+  function spawnEnemyBullet(s, vx, vy) {
+    bullets.push({ x: s.x, y: s.y, vx, vy, trail: [] });
+  }
+  function shooterFire(s) {
+    Audio.enemyFire();
+    const ax = player.x - s.x, ay = player.y - s.y;
+    const ang = Math.atan2(ay, ax);
+    if (s.pattern === 'single') {
+      spawnEnemyBullet(s, Math.cos(ang) * BULLET_SPEED, Math.sin(ang) * BULLET_SPEED);
+    } else if (s.pattern === 'triple') {
+      for (const off of [-Math.PI/12, 0, Math.PI/12]) {
+        const a = ang + off;
+        spawnEnemyBullet(s, Math.cos(a) * BULLET_SPEED, Math.sin(a) * BULLET_SPEED);
+      }
+    } else if (s.pattern === 'radial') {
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        spawnEnemyBullet(s, Math.cos(a) * BULLET_SPEED, Math.sin(a) * BULLET_SPEED);
+      }
+    } else if (s.pattern === 'spiral') {
+      const a = s.spiralAngle;
+      spawnEnemyBullet(s, Math.cos(a) * BULLET_SPEED, Math.sin(a) * BULLET_SPEED);
+      s.spiralAngle += 0.5; // radians per shot
+    }
+  }
+
 
   const bullets = [];        // enemy bullets (red)
   const playerBullets = [];  // player bullets (blue)
@@ -250,12 +341,9 @@
   function resetGame() {
     bullets.length = 0;
     playerBullets.length = 0;
-    shooters.length = 0;
-    shooters.push(
-      { x: W / 2,  y: 60,     cooldown: 1.5 },
-      { x: 60,     y: H - 60, cooldown: 1.0 },
-      { x: W - 60, y: H - 60, cooldown: 0.5 },
-    );
+    currentWave = 1;
+    waveClearTimer = 0;
+    shooters = makeWave(currentWave);
     player.x = W / 2; player.y = H / 2;
     kills = 0; fireTimer = 0; elapsed = 0; nearMisses = 0; finalScore = 0;
     gameState = 'playing';
@@ -315,21 +403,47 @@
       Audio.fire();
     }
 
-    // --- Shooters: WORLD time ---
+    // --- Shooters: WORLD time. Walkers drift toward random offsets. ---
     for (let si = shooters.length - 1; si >= 0; si--) {
       const s = shooters[si];
+      // Walker movement: pick a random nearby target every retargetIn seconds,
+      // drift toward it at 40 px/s (world time). Keeps shooters from sitting still.
+      if (s.type === 'walker') {
+        s.retargetIn -= dtWorld;
+        if (s.retargetIn <= 0) {
+          s.retargetIn = 2;
+          s.tx = Math.max(50, Math.min(W - 50, s.x + (Math.random() - 0.5) * 200));
+          s.ty = Math.max(50, Math.min(H - 50, s.y + (Math.random() - 0.5) * 200));
+        }
+        const dxw = s.tx - s.x, dyw = s.ty - s.y;
+        const dm = Math.hypot(dxw, dyw);
+        if (dm > 1) {
+          s.x += (dxw / dm) * 40 * dtWorld;
+          s.y += (dyw / dm) * 40 * dtWorld;
+        }
+      }
       s.cooldown -= dtWorld;
       if (s.cooldown <= 0) {
-        s.cooldown += SHOOT_INTERVAL;
-        const ax = player.x - s.x, ay = player.y - s.y;
-        const m = Math.hypot(ax, ay) || 1;
-        bullets.push({
-          x: s.x, y: s.y,
-          vx: (ax / m) * BULLET_SPEED,
-          vy: (ay / m) * BULLET_SPEED,
-          trail: [],
-        });
-        Audio.enemyFire();
+        s.cooldown += s.fireInterval;
+        if (s.type !== 'boss') shooterFire(s);
+        // boss firing handled separately in cycle 7
+      }
+    }
+
+    // --- Wave clear ---
+    if (gameState === 'playing' && shooters.length === 0 && waveClearTimer <= 0) {
+      waveClearTimer = 1.5;
+    }
+    if (waveClearTimer > 0) {
+      waveClearTimer -= dtReal;
+      if (waveClearTimer <= 0 && gameState === 'playing') {
+        currentWave++;
+        if (currentWave > 20) {
+          // Beyond wave 20 → win handled in cycle 7. For cycle 6, wrap.
+          currentWave = 20;
+        }
+        shooters = makeWave(currentWave);
+        bullets.length = 0;
       }
     }
 
@@ -413,19 +527,39 @@
       ctx.translate((Math.random() - 0.5) * a * 2, (Math.random() - 0.5) * a * 2);
     }
 
-    // shooters (black triangles, point at player)
-    ctx.fillStyle = '#000';
+    // shooters
     for (const s of shooters) {
-      const ang = Math.atan2(player.y - s.y, player.x - s.x);
       ctx.save();
       ctx.translate(s.x, s.y);
-      ctx.rotate(ang);
-      ctx.beginPath();
-      ctx.moveTo(14, 0);
-      ctx.lineTo(-10, -10);
-      ctx.lineTo(-10,  10);
-      ctx.closePath();
-      ctx.fill();
+      if (s.type === 'boss') {
+        // Boss hexagon (cycle 7 expands phases). Slowly rotates in WORLD time.
+        s.rot = (s.rot || 0) + dtWorld * 0.5;
+        ctx.rotate(s.rot);
+        const dangerGlow = s.phase >= 4;
+        if (dangerGlow) {
+          const rg = ctx.createRadialGradient(0, 0, 30, 0, 0, 90);
+          rg.addColorStop(0, 'rgba(220,0,0,0.5)');
+          rg.addColorStop(1, 'rgba(220,0,0,0)');
+          ctx.fillStyle = rg;
+          ctx.beginPath(); ctx.arc(0, 0, 90, 0, Math.PI * 2); ctx.fill();
+        }
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        for (let k = 0; k < 6; k++) {
+          const a = (k / 6) * Math.PI * 2;
+          const x = Math.cos(a) * 50, y = Math.sin(a) * 50;
+          if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.closePath(); ctx.fill();
+      } else {
+        // Triangle aimed at player
+        const ang = Math.atan2(player.y - s.y, player.x - s.x);
+        ctx.rotate(ang);
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        ctx.moveTo(14, 0); ctx.lineTo(-10, -10); ctx.lineTo(-10, 10);
+        ctx.closePath(); ctx.fill();
+      }
       ctx.restore();
     }
 
@@ -526,12 +660,25 @@
     const mins = Math.floor(elapsed / 60);
     const secs = Math.floor(elapsed % 60).toString().padStart(2, '0');
     hud.textContent =
+      `wave:        ${currentWave}/20\n` +
       `time scale:  ${timeScale.toFixed(2)}\n` +
       `mouse vel:   ${mouseVel.toFixed(0).padStart(4)} px/s\n` +
       `bullets:     ${bullets.length}\n` +
       `kills:       ${kills}\n` +
       `time:        ${mins}:${secs}\n` +
       `audio:       ${Audio.muted ? '🔇' : '🔊'}`;
+
+    // Wave-clear flash overlay
+    if (waveClearTimer > 0) {
+      const a = Math.min(1, waveClearTimer / 1.5);
+      ctx.fillStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`;
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#000';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 48px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillText(`WAVE ${currentWave} CLEARED`, W / 2, H / 2);
+      ctx.textAlign = 'start';
+    }
 
     // Death overlay
     if (gameState === 'dead') {
